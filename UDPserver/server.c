@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <sys/types.h>
@@ -22,7 +23,32 @@ struct pdu {
     char data[MAX_DATA];
 };
 
-int main() {
+static int valid_filename(const char *filename) {
+    if (filename[0] == '\0' || strcmp(filename, ".") == 0 || strcmp(filename, "..") == 0) {
+        return 0;
+    }
+
+    for (const unsigned char *ch = (const unsigned char *)filename; *ch; ch++) {
+        if (!isalnum(*ch) && *ch != '.' && *ch != '_' && *ch != '-') {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static void send_error(int sockfd, const struct sockaddr_in *client_addr,
+                       socklen_t addr_len, const char *message) {
+    struct pdu error_pdu = {0};
+    error_pdu.type = 'E';
+    snprintf(error_pdu.data, sizeof(error_pdu.data), "%s", message);
+    size_t packet_size = sizeof(error_pdu.type) + strlen(error_pdu.data) + 1;
+    if (sendto(sockfd, &error_pdu, packet_size, 0,
+               (const struct sockaddr *)client_addr, addr_len) < 0) {
+        perror("sendto error response");
+    }
+}
+
+int main(void) {
     int sockfd;
     struct sockaddr_in server_addr, client_addr;
     socklen_t addr_len = sizeof(client_addr);
@@ -50,7 +76,8 @@ int main() {
     printf("UDP server listening on port %d...\n", SERVER_PORT);
 
     while (1) {
-        // Wait for filename PDU from client
+        memset(&spdu, 0, sizeof(spdu));
+        addr_len = sizeof(client_addr);
         n = recvfrom(sockfd, &spdu, sizeof(spdu), 0,
                      (struct sockaddr *)&client_addr, &addr_len);
         if (n < 0) {
@@ -58,76 +85,69 @@ int main() {
             continue;
         }
 
-        // Expecting a filename request PDU: type 'C'
-        if (spdu.type != 'C') {
-            fprintf(stderr, "Received unexpected PDU type '%c'\n", spdu.type);
+        if (n < 2 || spdu.type != 'C') {
+            fprintf(stderr, "Received an invalid file request.\n");
             continue;
         }
 
-        // Extract the filename from spdu.data
-        char filename[256];
-        strncpy(filename, spdu.data, sizeof(filename) - 1);
-        filename[sizeof(filename) - 1] = '\0';
+        size_t request_data_size = (size_t)n - sizeof(spdu.type);
+        char *terminator = memchr(spdu.data, '\0', request_data_size);
+        if (terminator == NULL || !valid_filename(spdu.data)) {
+            send_error(sockfd, &client_addr, addr_len, "Invalid filename");
+            continue;
+        }
 
+        char filename[MAX_DATA];
+        snprintf(filename, sizeof(filename), "%s", spdu.data);
         printf("Client requested file: %s\n", filename);
 
-        // Open the file
-        int fd = open(filename, O_RDONLY);
+        int fd = open(filename, O_RDONLY | O_NOFOLLOW);
         if (fd < 0) {
-            // File not found or can't open -> send ERROR PDU
             perror("Error opening file");
-            struct pdu err_pdu;
-            err_pdu.type = 'E';
-            snprintf(err_pdu.data, MAX_DATA, "Cannot open '%s'", filename);
-            sendto(sockfd, &err_pdu, sizeof(err_pdu.type) + strlen(err_pdu.data) + 1,
-                   0, (struct sockaddr *)&client_addr, addr_len);
+            send_error(sockfd, &client_addr, addr_len, "File not available");
             continue;
         }
 
-        // Determine file size using lseek
-        off_t file_size = lseek(fd, 0, SEEK_END);
-        lseek(fd, 0, SEEK_SET);
+        struct stat file_info;
+        if (fstat(fd, &file_info) < 0 || !S_ISREG(file_info.st_mode)) {
+            fprintf(stderr, "Requested path is not a regular file.\n");
+            close(fd);
+            send_error(sockfd, &client_addr, addr_len, "File not available");
+            continue;
+        }
+        off_t remaining = file_info.st_size;
 
-        // If the file is empty (0 bytes), send a FINAL PDU with no data
-        if (file_size == 0) {
-            struct pdu final_pdu;
+        if (remaining == 0) {
+            struct pdu final_pdu = {0};
             final_pdu.type = 'F';
-            final_pdu.data[0] = '\0';
-            sendto(sockfd, &final_pdu, sizeof(final_pdu.type) + 1, 0,
-                   (struct sockaddr *)&client_addr, addr_len);
+            if (sendto(sockfd, &final_pdu, sizeof(final_pdu.type), 0,
+                       (struct sockaddr *)&client_addr, addr_len) < 0) {
+                perror("sendto");
+            }
             close(fd);
             continue;
         }
 
-        // Read file in chunks of up to MAX_DATA bytes
-        while (1) {
-            memset(spdu.data, 0, MAX_DATA);
-            n = read(fd, spdu.data, MAX_DATA);
+        while (remaining > 0) {
+            size_t chunk_size = remaining < MAX_DATA ? (size_t)remaining : MAX_DATA;
+            n = read(fd, spdu.data, chunk_size);
             if (n < 0) {
                 perror("Error reading file");
                 break;
             }
             if (n == 0) {
-                // End of file
+                fprintf(stderr, "File changed during transfer.\n");
                 break;
             }
+            remaining -= n;
 
-            // Decide if this is the final chunk
-            off_t current_offset = lseek(fd, 0, SEEK_CUR);
-            if (current_offset >= file_size) {
-                spdu.type = 'F'; // Final PDU
-            } else {
-                spdu.type = 'D'; // Data PDU
-            }
+            spdu.type = remaining == 0 ? 'F' : 'D';
 
-            // Send PDU: type + n bytes of data
             if (sendto(sockfd, &spdu, sizeof(spdu.type) + n, 0,
                        (struct sockaddr *)&client_addr, addr_len) < 0) {
                 perror("sendto error");
                 break;
             }
-
-            // If this was the final chunk, stop
             if (spdu.type == 'F') {
                 break;
             }

@@ -2,9 +2,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <ctype.h>
 #include <arpa/inet.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 
 #define SERVER_PORT 12345
 #define MAX_DATA 100
@@ -17,13 +19,48 @@ struct pdu {
     char data[MAX_DATA];
 };
 
-int main() {
+static int valid_filename(const char *filename) {
+    if (filename[0] == '\0' || strcmp(filename, ".") == 0 || strcmp(filename, "..") == 0) {
+        return 0;
+    }
+
+    for (const unsigned char *ch = (const unsigned char *)filename; *ch; ch++) {
+        if (!isalnum(*ch) && *ch != '.' && *ch != '_' && *ch != '-') {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int read_input(const char *prompt, char *buffer, size_t size) {
+    fputs(prompt, stdout);
+    fflush(stdout);
+    if (fgets(buffer, size, stdin) == NULL) {
+        return 0;
+    }
+
+    size_t length = strcspn(buffer, "\n");
+    if (buffer[length] == '\n') {
+        buffer[length] = '\0';
+        return 1;
+    }
+
+    if (!feof(stdin)) {
+        int ch;
+        while ((ch = getchar()) != '\n' && ch != EOF) {
+        }
+        fprintf(stderr, "Input is too long.\n");
+        return -1;
+    }
+    return 1;
+}
+
+int main(void) {
     int sockfd;
     struct sockaddr_in server_addr;
-    socklen_t addr_len = sizeof(server_addr);
     struct pdu cpdu;
     ssize_t n;
-    char choice[10];
+    char choice[16];
 
     // Create UDP socket
     if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
@@ -37,78 +74,113 @@ int main() {
     server_addr.sin_port        = htons(SERVER_PORT);
     server_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
 
+    if (connect(sockfd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+        perror("connect");
+        close(sockfd);
+        return EXIT_FAILURE;
+    }
+
+    struct timeval timeout = {.tv_sec = 10, .tv_usec = 0};
+    if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0) {
+        perror("setsockopt");
+        close(sockfd);
+        return EXIT_FAILURE;
+    }
+
     printf("UDP client started. Server port = %d\n", SERVER_PORT);
 
     while (1) {
-        printf("\nEnter 'd' to download a file or 'q' to quit: ");
-        fflush(stdout);
-        if (scanf("%s", choice) != 1) {
-            fprintf(stderr, "Error reading choice.\n");
+        int input_status = read_input("\nEnter 'd' to download a file or 'q' to quit: ",
+                                      choice, sizeof(choice));
+        if (input_status == 0) {
             break;
         }
+        if (input_status < 0) {
+            continue;
+        }
 
-        if (choice[0] == 'q') {
+        if (strcmp(choice, "q") == 0) {
             printf("Exiting client...\n");
             break;
-        } else if (choice[0] == 'd') {
-            // Prompt user for filename
-            char filename[256];
-            printf("Enter filename to download: ");
-            fflush(stdout);
-            if (scanf("%s", filename) != 1) {
-                fprintf(stderr, "Error reading filename.\n");
+        } else if (strcmp(choice, "d") == 0) {
+            char filename[MAX_DATA];
+            input_status = read_input("Enter filename to download: ", filename, sizeof(filename));
+            if (input_status == 0) {
+                break;
+            }
+            if (input_status < 0) {
+                continue;
+            }
+            if (!valid_filename(filename)) {
+                fprintf(stderr, "Use a simple filename without directory separators.\n");
                 continue;
             }
 
-            // Prepare and send FILENAME PDU (type 'C')
             memset(&cpdu, 0, sizeof(cpdu));
             cpdu.type = 'C';
-            strncpy(cpdu.data, filename, MAX_DATA - 1);
+            memcpy(cpdu.data, filename, strlen(filename) + 1);
 
-            // Send the PDU to the server
-            if (sendto(sockfd, &cpdu, sizeof(cpdu.type) + strlen(cpdu.data) + 1,
-                       0, (struct sockaddr *)&server_addr, addr_len) < 0) {
-                perror("sendto error");
+            size_t request_size = sizeof(cpdu.type) + strlen(cpdu.data) + 1;
+            if (send(sockfd, &cpdu, request_size, 0) != (ssize_t)request_size) {
+                perror("send");
                 continue;
             }
 
-            // Open local file for writing (in current directory)
             FILE *fp = fopen(filename, "wb");
             if (!fp) {
-                perror("Error opening local file for writing");
+                perror("fopen");
                 continue;
             }
 
             printf("Downloading '%s'...\n", filename);
-
-            // Receive data until FINAL PDU or ERROR PDU
+            int download_succeeded = 0;
             while (1) {
-                n = recvfrom(sockfd, &cpdu, sizeof(cpdu), 0, NULL, NULL);
+                n = recv(sockfd, &cpdu, sizeof(cpdu), 0);
                 if (n < 0) {
-                    perror("recvfrom error");
+                    perror("recv");
+                    break;
+                }
+                if (n < (ssize_t)sizeof(cpdu.type)) {
+                    fprintf(stderr, "Received an invalid response packet.\n");
                     break;
                 }
 
                 if (cpdu.type == 'E') {
-                    // Server reported an error
+                    size_t message_size = (size_t)n - sizeof(cpdu.type);
+                    if (message_size >= sizeof(cpdu.data)) {
+                        message_size = sizeof(cpdu.data) - 1;
+                    }
+                    cpdu.data[message_size] = '\0';
                     printf("Server error: %s\n", cpdu.data);
                     break;
                 }
 
-                // Number of bytes of actual file data = n - 1 (for the type field)
-                size_t data_len = n - sizeof(cpdu.type);
-                if (data_len > 0) {
-                    fwrite(cpdu.data, 1, data_len, fp);
+                if (cpdu.type != 'D' && cpdu.type != 'F') {
+                    fprintf(stderr, "Received an unknown response packet.\n");
+                    break;
                 }
 
+                size_t data_len = (size_t)n - sizeof(cpdu.type);
+                if (data_len > sizeof(cpdu.data) ||
+                    (data_len > 0 && fwrite(cpdu.data, 1, data_len, fp) != data_len)) {
+                    fprintf(stderr, "Could not write the downloaded file.\n");
+                    break;
+                }
                 if (cpdu.type == 'F') {
-                    // Final chunk received
-                    printf("File '%s' downloaded successfully.\n", filename);
+                    download_succeeded = 1;
                     break;
                 }
             }
 
-            fclose(fp);
+            if (fclose(fp) != 0) {
+                perror("fclose");
+                download_succeeded = 0;
+            }
+            if (download_succeeded) {
+                printf("File '%s' downloaded successfully.\n", filename);
+            } else {
+                unlink(filename);
+            }
 
         } else {
             printf("Invalid option. Please try again.\n");
